@@ -3,17 +3,20 @@ FROM python:3.12-slim
 # 安装必要证书与网络工具
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
-# 通过 pip 安装 uv
-RUN pip install --no-cache-dir uv
-
-WORKDIR /app
-
-# 配置环境变量
-ENV UV_SYSTEM_PYTHON=1 \
+# 配置清华大学 PyPI 镜像源
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple \
+    UV_SYSTEM_PYTHON=1 \
     PYTHONUNBUFFERED=1
+
+# 全局配置 pip 镜像源并安装 uv
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
+    pip install --no-cache-dir uv
 
 # 编译参数：默认不安装 CUDA / PyTorch，保持镜像轻量
 ARG WITH_CUDA=false
+
+WORKDIR /app
 
 # 拷贝依赖配置
 COPY requirements.txt pyproject.toml ./
