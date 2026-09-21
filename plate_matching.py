@@ -95,7 +95,8 @@ def print_decision_summary(result: Dict[str, Any], latency_ms: float):
 
     usage = result.get("usage")
     if usage:
-        print("\n=== OpenRouter Usage / Cost ===")
+        title = "OpenRouter Usage / Cost" if "cost" in usage else "Token 用量 (Usage)"
+        print(f"\n=== {title} ===")
         if "input_tokens" in usage:
             print(f"- 输入 Tokens: {usage.get('input_tokens')}")
         if "output_tokens" in usage:
