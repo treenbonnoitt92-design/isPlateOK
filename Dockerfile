@@ -1,7 +1,5 @@
 FROM python:3.12-slim
 
-# 安装必要证书与网络工具
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 # 配置清华大学 PyPI 镜像源
 ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
