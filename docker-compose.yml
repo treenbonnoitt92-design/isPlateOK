@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  jevlaya:
+    image: jevlaya:latest
+    container_name: jevlaya-app
+    restart: unless-stopped
+    ports:
+      - "13580:8000"
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1

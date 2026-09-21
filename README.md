@@ -142,6 +142,35 @@ python plate_matching.py --plate-in 京NC6545 --plate-out 京NC0545
 python plate_matching.py --model laya --plate-in 粤BD12345 --plate-out 粤B12345
 ```
 
+### 5. 🐳 Docker 容器化一键部署 (`deploy.sh`)
+
+项目提供了标准 `Dockerfile`、`docker-compose.yml` 及自动化部署脚本 `deploy.sh`：
+- **基础镜像**：`python:3.12-slim`
+- **运行方式**：容器内默认采用 `uv run` 启动服务
+- **外部端口映射**：默认映射为 **`13580:8000`**
+- **Compose 规范**：`docker-compose.yml` 严格使用镜像 `image: jevlaya:latest`（不包含 `build`）
+
+#### 快速启动（默认轻量模式，无 CUDA）
+```bash
+chmod +x deploy.sh
+./deploy.sh
+```
+部署成功后直接访问：👉 **http://<服务器IP>:13580**
+
+#### 可选：启用 CUDA / 本地 Laya 编译开关
+```bash
+./deploy.sh --cuda
+```
+
+#### 管理容器
+```bash
+# 查看实时日志
+docker compose logs -f
+
+# 停止服务
+docker compose down
+```
+
 ---
 
 ## 🔌 API 接口文档
