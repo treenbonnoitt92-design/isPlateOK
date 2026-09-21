@@ -1,11 +1,16 @@
+import os
 import time
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-import laya
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from jev_client import JevClient
 
 # 常见车牌 OCR 字符形近混淆知识库
 OCR_CONFUSION_PAIRS = {
@@ -20,21 +25,48 @@ OCR_CONFUSION_PAIRS = {
     frozenset(['C', 'G']): "字母 'C' 与 'G' 弧线相似"
 }
 
-agent = None
+# Jev 云端客户端（默认推荐引擎）与 Laya 本地智能体（按需懒加载）
+jev_client: Optional[JevClient] = None
+laya_agent = None
+
+try:
+    jev_client = JevClient()
+except Exception as e:
+    print(f"[INFO] JevClient 未能立即初始化（将在首次请求时检查）: {e}")
+
+
+def get_laya_agent():
+    """按需延迟加载本地 Laya 模型，避免系统启动时占用巨大资源与显存"""
+    global laya_agent
+    if laya_agent is None:
+        import laya
+        print("[INFO] 正在按需加载 Laya 决策模型 (convaiinnovations/laya)...")
+        laya_agent = laya.load("convaiinnovations/laya")
+        print("[INFO] Laya 决策模型按需加载就绪！")
+    return laya_agent
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global agent
-    print("[INFO] 正在预加载 Laya 决策模型 (convaiinnovations/laya)...")
-    agent = laya.load("convaiinnovations/laya")
-    print("[INFO] Laya 决策模型预加载就绪！")
+    global jev_client
+    print("[INFO] 系统启动完成：默认使用 Jev 云端引擎，Laya 模型采用懒加载机制。")
+    if jev_client is None:
+        try:
+            jev_client = JevClient()
+            print("[INFO] JevClient 初始化就绪！")
+        except Exception as e:
+            print(f"[WARN] JevClient 延迟初始化提示: {e}")
     yield
 
-app = FastAPI(title="Laya 车牌智能对齐与一致性决策系统", lifespan=lifespan)
+
+app = FastAPI(title="车牌智能对齐与双引擎一致性决策系统 (Jev / Laya)", lifespan=lifespan)
+
 
 class MatchRequest(BaseModel):
     plate_in: str
     plate_out: str
+    model: str = "jev"  # "jev" or "laya", defaults to "jev"
+
 
 def analyze_plate_diff_smart(p_in: str, p_out: str) -> Dict[str, Any]:
     """
@@ -143,15 +175,18 @@ def analyze_plate_diff_smart(p_in: str, p_out: str) -> Dict[str, Any]:
         "diff_details": alignment
     }
 
+
 @app.post("/api/match")
 async def match_plates(req: MatchRequest):
-    global agent
-    if agent is None:
-        agent = laya.load("convaiinnovations/laya")
+    global jev_client, laya_agent
+
+    selected_model = req.model.strip().lower() if req.model else "jev"
+    if selected_model not in ("jev", "laya"):
+        selected_model = "jev"
 
     analysis = analyze_plate_diff_smart(req.plate_in, req.plate_out)
 
-    # 1. 完全一致
+    # 1. 完全一致短路拦截
     if analysis["diff_count"] == 0:
         return {
             "conclusion": "车牌完全一致",
@@ -160,10 +195,14 @@ async def match_plates(req: MatchRequest):
             "confidence": 1.0,
             "decision": "same_vehicle",
             "decision_label": "同一车辆（车牌无差异）",
+            "decision_probabilities": {"same_vehicle": 1.0, "different_vehicles": 0.0},
             "score": 3.0,
             "latency_ms": 0.1,
+            "model_used": selected_model,
+            "model_name": "exact_match_rule",
             "analysis": analysis,
-            "raw_laya": {"notice": "100% exact match across all aligned characters"}
+            "raw_laya": {"notice": "100% exact match across all aligned characters"},
+            "raw_response": {"notice": "100% exact match across all aligned characters"}
         }
 
     # 2. 差异过大（编辑距离 >= 3 或匹配率低于 50%）直接短路拦截
@@ -175,13 +214,17 @@ async def match_plates(req: MatchRequest):
             "confidence": 0.99,
             "decision": "different_vehicles",
             "decision_label": "不同车辆（多字符相异）",
+            "decision_probabilities": {"same_vehicle": 0.005, "different_vehicles": 0.995},
             "score": 0.0,
             "latency_ms": 0.1,
+            "model_used": selected_model,
+            "model_name": "mismatch_rule",
             "analysis": analysis,
-            "raw_laya": {"notice": f"Significant mismatch: {analysis['diff_count']} differing characters after alignment"}
+            "raw_laya": {"notice": f"Significant mismatch: {analysis['diff_count']} differing characters after alignment"},
+            "raw_response": {"notice": f"Significant mismatch: {analysis['diff_count']} differing characters after alignment"}
         }
 
-    # 3. 存在 1-2 处微小差异或漏字错位，交给 Laya 进行非自回归概率裁决
+    # 3. 存在 1-2 处微小差异或漏字错位，交给选定模型进行非自回归概率裁决
     state = {
         "entrance_plate": analysis["p_in"],
         "exit_plate": analysis["p_out"],
@@ -222,16 +265,35 @@ async def match_plates(req: MatchRequest):
         }
     }
 
-    t0 = time.perf_counter()
-    laya_result = agent.predict(state, questions)
-    latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+    if selected_model == "jev":
+        if jev_client is None:
+            jev_client = JevClient()
+        t0 = time.perf_counter()
+        jev_result = await jev_client.apredict(state, questions)
+        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
 
-    answers = laya_result.get("answers", {})
-    is_same = answers.get("is_same_vehicle", {})
-    decision = answers.get("plate_match_decision", {})
-    conf_score = answers.get("match_confidence_score", {})
+        answers = jev_result.get("answers", {})
+        is_same = answers.get("is_same_vehicle", {})
+        decision = answers.get("plate_match_decision", {})
+        conf_score = answers.get("match_confidence_score", {})
+        prob_same = is_same.get("noul", 0.0)
+        model_name = jev_result.get("model", "jev")
+        raw_output = jev_result
+    elif selected_model == "laya":
+        agent = get_laya_agent()
+        t0 = time.perf_counter()
+        laya_result = agent.predict(state, questions)
+        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
 
-    prob_same = is_same.get("noul", 0.0)
+        answers = laya_result.get("answers", {})
+        is_same = answers.get("is_same_vehicle", {})
+        decision = answers.get("plate_match_decision", {})
+        conf_score = answers.get("match_confidence_score", {})
+        prob_same = is_same.get("noul", 0.0)
+        model_name = "convaiinnovations/laya"
+        raw_output = laya_result
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported model: {selected_model}")
 
     if prob_same >= 0.80:
         conclusion = "极大概率为同一辆车（判定为相机OCR识别或漏读误差）"
@@ -248,19 +310,25 @@ async def match_plates(req: MatchRequest):
         "distinct_different_vehicles": "不同车辆"
     }
 
+    choice_key = decision.get("choice", "")
+
     return {
         "conclusion": conclusion,
         "badge_color": badge_color,
         "probability_same": round(prob_same * 100, 2),
         "confidence": is_same.get("confidence", 0.0),
-        "decision": decision.get("choice", ""),
-        "decision_label": choice_labels.get(decision.get("choice", ""), decision.get("choice", "")),
+        "decision": choice_key,
+        "decision_label": choice_labels.get(choice_key, choice_key),
         "decision_probabilities": decision.get("probabilities", {}),
         "score": conf_score.get("score", 0.0),
         "latency_ms": latency_ms,
+        "model_used": selected_model,
+        "model_name": model_name,
         "analysis": analysis,
-        "raw_laya": laya_result
+        "raw_laya": raw_output,
+        "raw_response": raw_output
     }
+
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
@@ -269,7 +337,7 @@ async def serve_index():
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Laya AI 智能车牌对齐与一致性决策系统</title>
+  <title>车牌智能对齐与双引擎一致性决策系统 (Jev / Laya)</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
   <style>
@@ -319,7 +387,7 @@ async def serve_index():
   <div class="max-w-5xl mx-auto px-4 py-8">
     <header class="text-center mb-8">
       <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-500/10 border border-blue-500/30 text-blue-400 text-xs font-semibold mb-3">
-        <i class="fa-solid fa-brain"></i> 升级版：智能加权编辑距离对齐 + Laya 决策模型
+        <i class="fa-solid fa-brain"></i> 升级版：智能加权编辑距离对齐 + Jev / Laya 双引擎决策
       </div>
       <h1 class="text-3xl sm:text-4xl font-extrabold tracking-tight bg-gradient-to-r from-blue-400 via-indigo-300 to-purple-400 bg-clip-text text-transparent">
         车牌智能对齐与一致性决策系统
@@ -358,8 +426,74 @@ async def serve_index():
         </div>
       </div>
 
+      <!-- 决策模型引擎选择 (Segmented Radio Cards) -->
+      <div class="mt-6 pt-5 border-t border-slate-800/80">
+        <div class="flex items-center justify-between mb-2.5">
+          <label class="text-xs font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+            <i class="fa-solid fa-microchip text-indigo-400"></i> 决策模型引擎选择
+          </label>
+          <span class="text-[11px] text-slate-400">零样本非自回归概率输出</span>
+        </div>
+        
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <!-- Jev Option (Default) -->
+          <div
+            id="modelCardJev"
+            onclick="selectModel('jev')"
+            class="relative cursor-pointer rounded-xl p-3.5 border-2 border-blue-500 bg-blue-950/30 transition-all duration-200 hover:border-blue-400"
+          >
+            <div class="flex items-start justify-between">
+              <div class="flex items-center gap-2.5">
+                <input
+                  type="radio"
+                  id="radioModelJev"
+                  name="modelChoice"
+                  value="jev"
+                  checked
+                  class="w-4 h-4 text-blue-600 bg-slate-800 border-slate-600 focus:ring-blue-500 cursor-pointer"
+                />
+                <div>
+                  <div class="text-sm font-bold text-white flex items-center gap-1.5">
+                    <i class="fa-solid fa-cloud text-blue-400"></i> Jev (OpenRouter 云端决策)
+                    <span class="text-[10px] bg-amber-400/20 border border-amber-400/30 text-amber-300 px-1.5 py-0.2 rounded font-bold">⭐️ 默认</span>
+                  </div>
+                  <div class="text-xs text-slate-400 mt-1">云端极速响应 · 免本地大显存占用</div>
+                </div>
+              </div>
+              <i id="checkJev" class="fa-solid fa-circle-check text-blue-400 text-lg"></i>
+            </div>
+          </div>
+
+          <!-- Laya Option -->
+          <div
+            id="modelCardLaya"
+            onclick="selectModel('laya')"
+            class="relative cursor-pointer rounded-xl p-3.5 border-2 border-slate-800 bg-slate-800/30 transition-all duration-200 hover:border-slate-700"
+          >
+            <div class="flex items-start justify-between">
+              <div class="flex items-center gap-2.5">
+                <input
+                  type="radio"
+                  id="radioModelLaya"
+                  name="modelChoice"
+                  value="laya"
+                  class="w-4 h-4 text-blue-600 bg-slate-800 border-slate-600 focus:ring-blue-500 cursor-pointer"
+                />
+                <div>
+                  <div class="text-sm font-bold text-slate-300 flex items-center gap-1.5">
+                    <i class="fa-solid fa-server text-purple-400"></i> Laya (本地 GPU 模型)
+                  </div>
+                  <div class="text-xs text-slate-400 mt-1">convaiinnovations/laya · 本地按需加载权重</div>
+                </div>
+              </div>
+              <i id="checkLaya" class="fa-regular fa-circle text-slate-600 text-lg"></i>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- 快速预设 -->
-      <div class="mt-4 flex flex-wrap items-center gap-2 text-xs">
+      <div class="mt-5 flex flex-wrap items-center gap-2 text-xs">
         <span class="text-slate-400 font-medium"><i class="fa-solid fa-wand-magic-sparkles mr-1"></i>快捷测试场景:</span>
         <button onclick="setPreset('京NC6545', '京NC0545')" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg text-slate-300 transition">
           京NC6545 ⇄ 京NC0545 (6 vs 0 替换混淆)
@@ -401,7 +535,10 @@ async def serve_index():
             <i class="fa-solid fa-car-side"></i>
           </div>
           <div>
-            <div class="text-xs font-semibold uppercase tracking-wider text-slate-400">Laya 综合裁决</div>
+            <div class="flex items-center gap-2">
+              <span class="text-xs font-semibold uppercase tracking-wider text-slate-400">智能决策裁决</span>
+              <span id="modelEngineBadge" class="text-[11px] font-mono px-2 py-0.5 rounded-full bg-blue-500/10 border border-blue-500/30 text-blue-300">Jev</span>
+            </div>
             <div id="conclusionText" class="text-xl sm:text-2xl font-bold text-white mt-1">--</div>
             <div id="decisionDesc" class="text-xs text-slate-400 mt-1">--</div>
           </div>
@@ -478,7 +615,7 @@ async def serve_index():
 
       <details class="bg-slate-900/60 border border-slate-800 rounded-xl p-4 text-xs">
         <summary class="cursor-pointer text-slate-400 hover:text-slate-200 font-mono flex items-center justify-between">
-          <span><i class="fa-solid fa-code mr-1"></i>查看完整对齐细节与 Laya 原始决策结构 (JSON)</span>
+          <span><i class="fa-solid fa-code mr-1"></i>查看完整对齐细节与决策模型原始结构 (JSON)</span>
           <i class="fa-solid fa-chevron-down text-xs"></i>
         </summary>
         <pre id="rawJson" class="mt-3 p-3 bg-slate-950 rounded-lg overflow-x-auto text-emerald-400 font-mono text-[11px] leading-relaxed"></pre>
@@ -487,6 +624,32 @@ async def serve_index():
   </div>
 
   <script>
+    let currentModel = 'jev';
+
+    function selectModel(model) {
+      currentModel = model;
+      const isJev = (model === 'jev');
+      document.getElementById('radioModelJev').checked = isJev;
+      document.getElementById('radioModelLaya').checked = !isJev;
+
+      const cardJev = document.getElementById('modelCardJev');
+      const cardLaya = document.getElementById('modelCardLaya');
+      const checkJev = document.getElementById('checkJev');
+      const checkLaya = document.getElementById('checkLaya');
+
+      if (isJev) {
+        cardJev.className = 'relative cursor-pointer rounded-xl p-3.5 border-2 border-blue-500 bg-blue-950/30 transition-all duration-200 hover:border-blue-400';
+        checkJev.className = 'fa-solid fa-circle-check text-blue-400 text-lg';
+        cardLaya.className = 'relative cursor-pointer rounded-xl p-3.5 border-2 border-slate-800 bg-slate-800/30 transition-all duration-200 hover:border-slate-700';
+        checkLaya.className = 'fa-regular fa-circle text-slate-600 text-lg';
+      } else {
+        cardLaya.className = 'relative cursor-pointer rounded-xl p-3.5 border-2 border-purple-500 bg-purple-950/30 transition-all duration-200 hover:border-purple-400';
+        checkLaya.className = 'fa-solid fa-circle-check text-purple-400 text-lg';
+        cardJev.className = 'relative cursor-pointer rounded-xl p-3.5 border-2 border-slate-800 bg-slate-800/30 transition-all duration-200 hover:border-slate-700';
+        checkJev.className = 'fa-regular fa-circle text-slate-600 text-lg';
+      }
+    }
+
     function setPreset(pIn, pOut) {
       document.getElementById('plateIn').value = pIn;
       document.getElementById('plateOut').value = pOut;
@@ -504,17 +667,21 @@ async def serve_index():
         return;
       }
 
+      const modelDisplayName = currentModel === 'jev' ? 'Jev (OpenRouter)' : 'Laya (本地GPU)';
       btn.disabled = true;
-      btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> <span>智能对齐与 Laya 推断中...</span>';
+      btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> <span>智能对齐与 ${modelDisplayName} 推断中...</span>`;
 
       try {
         const resp = await fetch('/api/match', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ plate_in: pIn, plate_out: pOut })
+          body: JSON.stringify({ plate_in: pIn, plate_out: pOut, model: currentModel })
         });
 
-        if (!resp.ok) throw new Error('请求错误: ' + resp.statusText);
+        if (!resp.ok) {
+          const errData = await resp.json().catch(() => ({}));
+          throw new Error(errData.detail || resp.statusText);
+        }
         const data = await resp.json();
 
         renderResult(data);
@@ -532,7 +699,20 @@ async def serve_index():
       document.getElementById('probValue').innerText = data.probability_same + '%';
       document.getElementById('confValue').innerText = data.confidence;
       document.getElementById('latencyValue').innerText = data.latency_ms + ' ms';
-      document.getElementById('decisionDesc').innerText = 'Laya判定: ' + (data.decision_label || data.decision);
+
+      const modelDisplayName = (data.model_used === 'jev' ? 'Jev' : (data.model_used === 'laya' ? 'Laya' : '规则'));
+      const fullModelBadge = `${modelDisplayName}: ${data.model_name || data.model_used}`;
+      const badgeEl = document.getElementById('modelEngineBadge');
+      if (badgeEl) {
+        badgeEl.innerText = fullModelBadge;
+        if (data.model_used === 'laya') {
+          badgeEl.className = 'text-[11px] font-mono px-2 py-0.5 rounded-full bg-purple-500/10 border border-purple-500/30 text-purple-300';
+        } else {
+          badgeEl.className = 'text-[11px] font-mono px-2 py-0.5 rounded-full bg-blue-500/10 border border-blue-500/30 text-blue-300';
+        }
+      }
+
+      document.getElementById('decisionDesc').innerText = `${modelDisplayName}判定: ` + (data.decision_label || data.decision);
 
       const banner = document.getElementById('statusBanner');
       const icon = document.getElementById('statusIcon');
@@ -615,8 +795,10 @@ async def serve_index():
       });
 
       document.getElementById('rawJson').innerText = JSON.stringify({
+        model_used: data.model_used,
+        model_name: data.model_name,
         alignment_analysis: data.analysis,
-        laya_output: data.raw_laya
+        raw_output: data.raw_response || data.raw_laya
       }, null, 2);
     }
 
