@@ -6,7 +6,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from jev_client import JevClient
+import app as app_module
 from app import app
+
+
+@pytest.fixture(autouse=True)
+def ensure_test_env(monkeypatch):
+    """Ensure OPENROUTER_API_KEY is present and jev_client is initialized for tests."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "mock-openrouter-key")
+    if app_module.jev_client is None:
+        app_module.jev_client = JevClient(api_key="mock-openrouter-key")
 
 
 @pytest.fixture
@@ -18,9 +28,9 @@ def client():
 def test_exact_match_short_circuit(client):
     """
     Exact match short-circuit (e.g. '京NC6545' vs '京NC6545')
-    Should return 100%, 0.1ms, and no model should be called.
+    Should return 100%, 0.1ms, model_used='rule', and no model should be called.
     """
-    with patch("app.jev_client") as mock_jev, patch("app.laya_agent") as mock_laya:
+    with patch("jev_client.JevClient.apredict") as mock_jev, patch("app.laya_agent") as mock_laya:
         payload = {"plate_in": "京NC6545", "plate_out": "京NC6545"}
         resp = client.post("/api/match", json=payload)
         assert resp.status_code == 200
@@ -30,12 +40,12 @@ def test_exact_match_short_circuit(client):
         assert data["decision"] == "same_vehicle"
         assert data["latency_ms"] <= 1.0
         assert data["badge_color"] == "emerald"
+        assert data["model_used"] == "rule"
+        assert data["model_name"] == "exact_match_rule"
         assert data["analysis"]["diff_count"] == 0
 
         # Neither model should be invoked
-        if mock_jev:
-            assert not mock_jev.predict.called
-            assert not mock_jev.apredict.called
+        assert not mock_jev.called
         if mock_laya:
             assert not mock_laya.predict.called
 
@@ -43,9 +53,9 @@ def test_exact_match_short_circuit(client):
 def test_distinct_plate_short_circuit(client):
     """
     Distinct plate short-circuit (e.g. '沪A12345' vs '浙B67890')
-    Should return mismatch, 0.1ms, and no model should be called.
+    Should return mismatch, 0.1ms, model_used='rule', and no model should be called.
     """
-    with patch("app.jev_client") as mock_jev, patch("app.laya_agent") as mock_laya:
+    with patch("jev_client.JevClient.apredict") as mock_jev, patch("app.laya_agent") as mock_laya:
         payload = {"plate_in": "沪A12345", "plate_out": "浙B67890"}
         resp = client.post("/api/match", json=payload)
         assert resp.status_code == 200
@@ -55,12 +65,12 @@ def test_distinct_plate_short_circuit(client):
         assert data["decision"] == "different_vehicles"
         assert data["badge_color"] == "red"
         assert data["latency_ms"] <= 1.0
+        assert data["model_used"] == "rule"
+        assert data["model_name"] == "mismatch_rule"
         assert data["analysis"]["diff_count"] >= 3
 
         # Neither model should be invoked
-        if mock_jev:
-            assert not mock_jev.predict.called
-            assert not mock_jev.apredict.called
+        assert not mock_jev.called
         if mock_laya:
             assert not mock_laya.predict.called
 
@@ -84,8 +94,7 @@ def test_request_without_model_defaults_to_jev(client):
         }
     }
 
-    # Patch apredict / predict on jev_client in app
-    with patch("app.jev_client.apredict", new_callable=AsyncMock, return_value=mock_jev_result) as mock_apredict:
+    with patch("jev_client.JevClient.apredict", new_callable=AsyncMock, return_value=mock_jev_result) as mock_apredict:
         payload = {"plate_in": "京NC6545", "plate_out": "京NC0545"}
         resp = client.post("/api/match", json=payload)
         assert resp.status_code == 200
@@ -118,7 +127,7 @@ def test_request_with_explicit_model_jev(client):
         }
     }
 
-    with patch("app.jev_client.apredict", new_callable=AsyncMock, return_value=mock_jev_result) as mock_apredict:
+    with patch("jev_client.JevClient.apredict", new_callable=AsyncMock, return_value=mock_jev_result) as mock_apredict:
         payload = {"plate_in": "京NC6545", "plate_out": "京NC0545", "model": "jev"}
         resp = client.post("/api/match", json=payload)
         assert resp.status_code == 200
@@ -132,7 +141,7 @@ def test_request_with_explicit_model_jev(client):
 
 def test_request_with_model_laya(client):
     """
-    Request with model='laya' -> lazy loads laya and calls laya_agent.predict.
+    Request with model='laya' -> lazy loads laya and calls laya_agent.predict in threadpool.
     """
     mock_laya_agent = MagicMock()
     mock_laya_agent.predict.return_value = {
@@ -148,8 +157,6 @@ def test_request_with_model_laya(client):
     }
 
     with patch("laya.load", return_value=mock_laya_agent) as mock_load:
-        # Ensure laya_agent is reset to None before call
-        import app as app_module
         app_module.laya_agent = None
 
         payload = {"plate_in": "京NC6545", "plate_out": "京NC0545", "model": "laya"}
@@ -162,3 +169,29 @@ def test_request_with_model_laya(client):
         assert data["probability_same"] == 82.0
         assert mock_load.called
         assert mock_laya_agent.predict.called
+
+
+def test_model_inference_failure_raises_502_jev(client):
+    """
+    When Jev inference fails with exception, app should return 502 with formatted detail.
+    """
+    with patch("jev_client.JevClient.apredict", new_callable=AsyncMock, side_effect=RuntimeError("OpenRouter Timeout")):
+        payload = {"plate_in": "京NC6545", "plate_out": "京NC0545", "model": "jev"}
+        resp = client.post("/api/match", json=payload)
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == "决策模型推断失败 (jev): OpenRouter Timeout"
+
+
+def test_model_inference_failure_raises_502_laya(client):
+    """
+    When Laya inference fails with exception, app should return 502 with formatted detail.
+    """
+    mock_agent = MagicMock()
+    mock_agent.predict.side_effect = RuntimeError("CUDA OOM")
+    with patch("laya.load", return_value=mock_agent):
+        app_module.laya_agent = None
+
+        payload = {"plate_in": "京NC6545", "plate_out": "京NC0545", "model": "laya"}
+        resp = client.post("/api/match", json=payload)
+        assert resp.status_code == 502
+        assert resp.json()["detail"] == "决策模型推断失败 (laya): CUDA OOM"

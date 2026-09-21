@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from starlette.concurrency import run_in_threadpool
 
 load_dotenv()
 
@@ -198,7 +199,7 @@ async def match_plates(req: MatchRequest):
             "decision_probabilities": {"same_vehicle": 1.0, "different_vehicles": 0.0},
             "score": 3.0,
             "latency_ms": 0.1,
-            "model_used": selected_model,
+            "model_used": "rule",
             "model_name": "exact_match_rule",
             "analysis": analysis,
             "raw_laya": {"notice": "100% exact match across all aligned characters"},
@@ -217,7 +218,7 @@ async def match_plates(req: MatchRequest):
             "decision_probabilities": {"same_vehicle": 0.005, "different_vehicles": 0.995},
             "score": 0.0,
             "latency_ms": 0.1,
-            "model_used": selected_model,
+            "model_used": "rule",
             "model_name": "mismatch_rule",
             "analysis": analysis,
             "raw_laya": {"notice": f"Significant mismatch: {analysis['diff_count']} differing characters after alignment"},
@@ -265,35 +266,40 @@ async def match_plates(req: MatchRequest):
         }
     }
 
-    if selected_model == "jev":
-        if jev_client is None:
-            jev_client = JevClient()
-        t0 = time.perf_counter()
-        jev_result = await jev_client.apredict(state, questions)
-        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+    try:
+        if selected_model == "jev":
+            if jev_client is None:
+                jev_client = JevClient()
+            t0 = time.perf_counter()
+            jev_result = await jev_client.apredict(state, questions)
+            latency_ms = round((time.perf_counter() - t0) * 1000, 2)
 
-        answers = jev_result.get("answers", {})
-        is_same = answers.get("is_same_vehicle", {})
-        decision = answers.get("plate_match_decision", {})
-        conf_score = answers.get("match_confidence_score", {})
-        prob_same = is_same.get("noul", 0.0)
-        model_name = jev_result.get("model", "jev")
-        raw_output = jev_result
-    elif selected_model == "laya":
-        agent = get_laya_agent()
-        t0 = time.perf_counter()
-        laya_result = agent.predict(state, questions)
-        latency_ms = round((time.perf_counter() - t0) * 1000, 2)
+            answers = jev_result.get("answers", {})
+            is_same = answers.get("is_same_vehicle", {})
+            decision = answers.get("plate_match_decision", {})
+            conf_score = answers.get("match_confidence_score", {})
+            prob_same = is_same.get("noul", 0.0)
+            model_name = jev_result.get("model", "jev")
+            raw_output = jev_result
+        elif selected_model == "laya":
+            agent = get_laya_agent()
+            t0 = time.perf_counter()
+            laya_result = await run_in_threadpool(agent.predict, state, questions)
+            latency_ms = round((time.perf_counter() - t0) * 1000, 2)
 
-        answers = laya_result.get("answers", {})
-        is_same = answers.get("is_same_vehicle", {})
-        decision = answers.get("plate_match_decision", {})
-        conf_score = answers.get("match_confidence_score", {})
-        prob_same = is_same.get("noul", 0.0)
-        model_name = "convaiinnovations/laya"
-        raw_output = laya_result
-    else:
-        raise HTTPException(status_code=400, detail=f"Unsupported model: {selected_model}")
+            answers = laya_result.get("answers", {})
+            is_same = answers.get("is_same_vehicle", {})
+            decision = answers.get("plate_match_decision", {})
+            conf_score = answers.get("match_confidence_score", {})
+            prob_same = is_same.get("noul", 0.0)
+            model_name = "convaiinnovations/laya"
+            raw_output = laya_result
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported model: {selected_model}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"决策模型推断失败 ({selected_model}): {str(e)}")
 
     if prob_same >= 0.80:
         conclusion = "极大概率为同一辆车（判定为相机OCR识别或漏读误差）"
@@ -680,7 +686,8 @@ async def serve_index():
 
         if (!resp.ok) {
           const errData = await resp.json().catch(() => ({}));
-          throw new Error(errData.detail || resp.statusText);
+          const msg = typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail);
+          throw new Error(msg || resp.statusText);
         }
         const data = await resp.json();
 
@@ -707,6 +714,8 @@ async def serve_index():
         badgeEl.innerText = fullModelBadge;
         if (data.model_used === 'laya') {
           badgeEl.className = 'text-[11px] font-mono px-2 py-0.5 rounded-full bg-purple-500/10 border border-purple-500/30 text-purple-300';
+        } else if (data.model_used === 'rule') {
+          badgeEl.className = 'text-[11px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-300';
         } else {
           badgeEl.className = 'text-[11px] font-mono px-2 py-0.5 rounded-full bg-blue-500/10 border border-blue-500/30 text-blue-300';
         }
@@ -731,10 +740,10 @@ async def serve_index():
         icon.className = 'w-14 h-14 rounded-2xl flex items-center justify-center text-2xl bg-red-500/20 text-red-400';
       }
 
-      const isGreen = data.analysis.p_in.length === 8;
-      const plateClass = isGreen ? 'plate-badge-green' : 'plate-badge-blue';
-      document.getElementById('previewIn').className = `${plateClass} px-4 py-2 rounded-lg text-lg`;
-      document.getElementById('previewOut').className = `${plateClass} px-4 py-2 rounded-lg text-lg`;
+      const inClass = data.analysis.p_in.length === 8 ? 'plate-badge-green' : 'plate-badge-blue';
+      const outClass = data.analysis.p_out.length === 8 ? 'plate-badge-green' : 'plate-badge-blue';
+      document.getElementById('previewIn').className = `${inClass} px-4 py-2 rounded-lg text-lg`;
+      document.getElementById('previewOut').className = `${outClass} px-4 py-2 rounded-lg text-lg`;
       document.getElementById('previewIn').innerText = data.analysis.p_in;
       document.getElementById('previewOut').innerText = data.analysis.p_out;
 
