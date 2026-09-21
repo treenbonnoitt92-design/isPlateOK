@@ -3,8 +3,8 @@ FROM python:3.12-slim
 # 安装必要证书与网络工具
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
-# 从官方镜像拷贝 uv 二进制文件
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+# 通过 pip 安装 uv
+RUN pip install --no-cache-dir uv
 
 WORKDIR /app
 
