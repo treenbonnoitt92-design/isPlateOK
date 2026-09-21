@@ -80,6 +80,32 @@ def build_state_and_questions(plate_in: str, plate_out: str) -> tuple[Dict[str, 
     return state, questions
 
 
+def print_decision_summary(result: Dict[str, Any], latency_ms: float):
+    answers = result.get("answers", {})
+    is_same = answers.get("is_same_vehicle", {})
+    decision = answers.get("plate_match_decision", {})
+    conf_score = answers.get("match_confidence_score", {})
+
+    print("\n=== 结论汇总 ===")
+    conf_str = f" (置信度: {is_same['confidence']})" if "confidence" in is_same else ""
+    print(f"1. 同车概率 (noul P(True)): {is_same.get('noul', 0) * 100:.2f}%{conf_str}")
+    print(f"2. 分类判定: {decision.get('choice')} (各类别概率: {decision.get('probabilities')})")
+    print(f"3. 相似度评分: {conf_score.get('score', 0):.2f} / 3.0")
+    print(f"4. 决策耗时: {latency_ms:.2f} ms")
+
+    usage = result.get("usage")
+    if usage:
+        print("\n=== OpenRouter Usage / Cost ===")
+        if "input_tokens" in usage:
+            print(f"- 输入 Tokens: {usage.get('input_tokens')}")
+        if "output_tokens" in usage:
+            print(f"- 输出 Tokens: {usage.get('output_tokens')}")
+        if "total_tokens" in usage:
+            print(f"- 总计 Tokens: {usage.get('total_tokens')}")
+        if "cost" in usage:
+            print(f"- 推理花费: ${usage.get('cost'):.6f}")
+
+
 def evaluate_plates(model: str = "jev", plate_in: str = "京NC6545", plate_out: str = "京NC0545"):
     state, questions = build_state_and_questions(plate_in, plate_out)
 
@@ -89,40 +115,28 @@ def evaluate_plates(model: str = "jev", plate_in: str = "京NC6545", plate_out: 
 
     t0 = time.perf_counter()
     if model == "jev":
-        from jev_client import JevClient
-        client = JevClient()
+        try:
+            from jev_client import JevClient
+            client = JevClient()
+        except RuntimeError as e:
+            print(f"[!] 初始化 JevClient 失败: {e}", file=sys.stderr)
+            print("[!] 请确保设置了 OPENROUTER_API_KEY 环境变量或在 .env 文件中配置。", file=sys.stderr)
+            raise
+
         result = client.predict(state, questions)
         latency_ms = (time.perf_counter() - t0) * 1000
 
         print("=== Jev 模型决策结果 ===")
         print(json.dumps(result, indent=2, ensure_ascii=False))
-
-        answers = result.get("answers", {})
-        is_same = answers.get("is_same_vehicle", {})
-        decision = answers.get("plate_match_decision", {})
-        conf_score = answers.get("match_confidence_score", {})
-
-        print("\n=== 结论汇总 ===")
-        conf_str = f" (置信度: {is_same['confidence']})" if "confidence" in is_same else ""
-        print(f"1. 同车概率 (noul P(True)): {is_same.get('noul', 0) * 100:.2f}%{conf_str}")
-        print(f"2. 分类判定: {decision.get('choice')} (各类别概率: {decision.get('probabilities')})")
-        print(f"3. 相似度评分: {conf_score.get('score', 0):.2f} / 3.0")
-        print(f"4. 决策耗时: {latency_ms:.2f} ms")
-
-        usage = result.get("usage")
-        if usage:
-            print("\n=== OpenRouter Usage / Cost ===")
-            if "input_tokens" in usage:
-                print(f"- 输入 Tokens: {usage.get('input_tokens')}")
-            if "output_tokens" in usage:
-                print(f"- 输出 Tokens: {usage.get('output_tokens')}")
-            if "total_tokens" in usage:
-                print(f"- 总计 Tokens: {usage.get('total_tokens')}")
-            if "cost" in usage:
-                print(f"- 推理花费: ${usage.get('cost'):.6f}")
+        print_decision_summary(result, latency_ms)
 
     elif model == "laya":
-        import laya
+        try:
+            import laya
+        except ImportError as e:
+            print("[!] 本地 Laya 库未安装。请运行 `pip install laya torch` 进行安装，或使用默认的 Jev 云端引擎 (`--model jev`)。", file=sys.stderr)
+            raise
+
         print("[*] 正在加载 Laya 模型 (convaiinnovations/laya)...")
         agent = laya.load("convaiinnovations/laya")
         result = agent.predict(state, questions)
@@ -130,17 +144,7 @@ def evaluate_plates(model: str = "jev", plate_in: str = "京NC6545", plate_out: 
 
         print("=== Laya 模型决策结果 ===")
         print(json.dumps(result, indent=2, ensure_ascii=False))
-
-        answers = result.get("answers", {})
-        is_same = answers.get("is_same_vehicle", {})
-        decision = answers.get("plate_match_decision", {})
-        conf_score = answers.get("match_confidence_score", {})
-
-        print("\n=== 结论汇总 ===")
-        print(f"1. 同车概率 (noul P(True)): {is_same.get('noul', 0) * 100:.2f}% (置信度: {is_same.get('confidence', 0)})")
-        print(f"2. 分类判定: {decision.get('choice')} (各类别概率: {decision.get('probabilities')})")
-        print(f"3. 相似度评分: {conf_score.get('score', 0):.2f} / 3.0")
-        print(f"4. 决策耗时: {latency_ms:.2f} ms")
+        print_decision_summary(result, latency_ms)
     else:
         raise ValueError(f"Unknown model: {model}")
 
@@ -167,11 +171,18 @@ def main():
     )
     args = parser.parse_args()
 
-    evaluate_plates(
-        model=args.model,
-        plate_in=args.plate_in,
-        plate_out=args.plate_out
-    )
+    try:
+        evaluate_plates(
+            model=args.model,
+            plate_in=args.plate_in,
+            plate_out=args.plate_out
+        )
+    except KeyboardInterrupt:
+        print("\n[!] 操作已取消")
+        sys.exit(130)
+    except Exception as e:
+        print(f"\n[ERROR] 决策执行失败: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
